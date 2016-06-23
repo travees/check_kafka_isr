@@ -1,0 +1,57 @@
+#!/usr/bin/env ruby
+#  encoding: UTF-8
+
+require 'kazoo'
+require 'sensu-plugin/check/cli'
+
+class KafkaISRCheck < Sensu::Plugin::Check::CLI
+
+  option :zookeeper,
+    short:       '-z ZOOKEEPER_CONNECT_STRING',
+    long:        '--zookeeper ZOOKEEPER_CONNECT_STRING',
+    default:     'localhost:2181/kafka',
+    description: 'Zookeeper connect string (zk-1.local:2181,zk-2.local:2181/kafka)'
+
+  def initialize
+    super()
+    @crit = []
+    @cluster = Kazoo::Cluster.new(config[:zookeeper])
+    begin
+      @topics = @cluster.topics
+    rescue
+      abort "Failed to get topics from zookeeper (#{config[:zookeeper]})"
+    end
+  end
+
+  def configured_isr(topic_name)
+    topic = @cluster.zk.get(path: "/brokers/topics/#{topic_name}")
+    JSON.parse(topic[:data]).fetch('partitions')
+  end
+
+  def actual_isr(partition)
+    partition.isr.map(&:id)
+  end
+
+  def find_bad_partitions(name, topic)
+    @crit << "Topic '#{name}' is under-replicated (replication factor is #{topic.replication_factor}). Affected partitions:"
+    topic.partitions.each do |part|
+      if part.under_replicated?
+        current_isr = part.isr.map { |broker| broker.id if broker }
+        @crit << "P#{part.id}#{current_isr}"
+      end
+    end
+  end
+
+  def run
+    if @cluster.under_replicated?
+      @topics.each do |name, topic|
+        topic.under_replicated? &&
+          find_bad_partitions(name, topic)
+      end
+      critical(@crit.join(' '))
+    else
+      ok
+    end
+  end
+
+end
